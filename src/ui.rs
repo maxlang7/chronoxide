@@ -1341,3 +1341,82 @@ mod rendering_tests {
         assert!(content.contains("All day 5"));
     }
 }
+
+#[cfg(test)]
+mod demo_preview {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    #[test]
+    fn render_readonly_demo() {
+        let cache = backend::demo_cache();
+        assert!(!cache.events.is_empty());
+        assert!(cache.calendars.iter().all(|c| !c.writable));
+        let start = backend::week(Local::now().date_naive());
+        let entries = visible(&cache, start);
+        let mut terminal = Terminal::new(TestBackend::new(140, 39)).unwrap();
+        terminal.draw(|frame|{
+            frame.render_widget(Block::default().style(Style::default().bg(BG).fg(FG)),frame.area());
+            text(frame,Rect::new(0,0,140,1)," Calendar · demo · fictional events · read-only",Style::default().fg(FG));
+            let(grid,sidebar)=body_layout(Rect::new(0,1,140,36));
+            draw_grid(frame,grid,&entries,&cache,start,usize::MAX,420);
+            calendar_sidebar(frame,sidebar,&cache,&backend::Preferences::default());
+            text(frame,Rect::new(0,37,140,2),"←/→ week · j/k event · wheel scroll · c calendars · Enter view · q quit\nPgUp/PgDn scroll · Home/End day · t today",Style::default().fg(DIM));
+        }).unwrap();
+        let Some(path) = std::env::var_os("CALENDAR_TUI_RENDER_DOCS") else {
+            return;
+        };
+        fn hex(c: Color, default: Color) -> String {
+            match c {
+                Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+                Color::White => "#ffffff".into(),
+                _ => match default {
+                    Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+                    _ => "#282828".into(),
+                },
+            }
+        }
+        fn escape(s: &str) -> String {
+            s.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+        }
+        let buffer = terminal.backend().buffer();
+        let mut svg=String::from("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1260\" height=\"702\" viewBox=\"0 0 1260 702\"><title>Calendar TUI demo with fictional events</title><rect width=\"1260\" height=\"702\" fill=\"#282828\"/><g font-family=\"DejaVu Sans Mono,monospace\" font-size=\"14\" xml:space=\"preserve\">");
+        for y in 0..39u16 {
+            let mut x = 0;
+            while x < 140 {
+                let cell = &buffer[(x, y)];
+                let mut end = x + 1;
+                while end < 140
+                    && buffer[(end, y)].bg == cell.bg
+                    && buffer[(end, y)].fg == cell.fg
+                    && buffer[(end, y)].modifier == cell.modifier
+                {
+                    end += 1;
+                }
+                let value = (x..end)
+                    .map(|i| buffer[(i, y)].symbol())
+                    .collect::<String>();
+                svg.push_str(&format!(
+                    "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"18\" fill=\"{}\"/>",
+                    x * 9,
+                    y * 18,
+                    (end - x) * 9,
+                    hex(cell.bg, BG)
+                ));
+                if !value.trim().is_empty() {
+                    svg.push_str(&format!(
+                        "<text x=\"{}\" y=\"{}\" fill=\"{}\">{}</text>",
+                        x * 9,
+                        y * 18 + 14,
+                        hex(cell.fg, FG),
+                        escape(&value)
+                    ));
+                }
+                x = end;
+            }
+        }
+        svg.push_str("</g></svg>");
+        std::fs::write(path, svg).unwrap();
+    }
+}
