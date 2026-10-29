@@ -1,0 +1,17 @@
+/target/
+/result
+/result-*
+# Local Nix integration belongs to the host configuration, not this repository.
+/default.nix
+/shell.nix
+/preview.sh
+# OAuth credentials and local runtime data must never be versioned.
+.env
+.env.*
+*.credentials.json
+credentials.json
+token.json
+/events.json
+/preferences.json
+/.cache/
+.DS_Store
