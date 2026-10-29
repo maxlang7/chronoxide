@@ -1,1 +1,3 @@
-//! A Google Calendar client for the terminal.
+//! Google Calendar API, local cache, and event mutation support.
+
+pub mod backend;
