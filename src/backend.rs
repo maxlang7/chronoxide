@@ -502,6 +502,75 @@ pub fn save(entry: Entry, patch: Value) -> Result<Cache> {
     write_cache(&cache)?;
     Ok(cache)
 }
+pub fn validate_delete(entry: &Entry) -> Result<()> {
+    if !entry.calendar.writable {
+        bail!("This calendar is read-only");
+    }
+    if s(&entry.raw, "id").is_empty() || s(&entry.raw, "etag").is_empty() {
+        bail!("Missing event identity or version. Refresh before deleting.");
+    }
+    if entry.raw["recurrence"].is_array() {
+        bail!("Deleting a whole recurring series is not supported. Select an occurrence.");
+    }
+    Ok(())
+}
+fn delete_remote(client: &Client, token: &str, url: reqwest::Url, etag: &str) -> Result<()> {
+    let response = client
+        .delete(url.clone())
+        .bearer_auth(token)
+        .header("If-Match", etag)
+        .query(&[("sendUpdates", "none")])
+        .send()?;
+    if response.status() == reqwest::StatusCode::PRECONDITION_FAILED {
+        bail!("This event changed on Google. Refresh before deleting it.");
+    }
+    if !response.status().is_success() {
+        bail!(
+            "Delete failed: Google returned {}. Refresh before retrying.",
+            response.status()
+        );
+    }
+    let response = client
+        .get(url)
+        .bearer_auth(token)
+        .send()
+        .context("Delete was sent but verification failed. Refresh before retrying")?;
+    match response.status().as_u16() {
+        404 | 410 => Ok(()),
+        200 => {
+            let data: Value = response
+                .json()
+                .context("Delete was sent but verification failed. Refresh before retrying")?;
+            if data["status"] == "cancelled" {
+                Ok(())
+            } else {
+                bail!("Google still returns an active event. Refresh before retrying.")
+            }
+        }
+        _ => bail!(
+            "Delete was sent but verification returned {}. Refresh before retrying.",
+            response.status()
+        ),
+    }
+}
+pub fn delete(entry: Entry) -> Result<Cache> {
+    validate_delete(&entry)?;
+    let _lock = lock()?;
+    let client = client()?;
+    let token = token(&client)?;
+    delete_remote(
+        &client,
+        &token,
+        url(&entry.calendar.id, Some(&s(&entry.raw, "id")))?,
+        &s(&entry.raw, "etag"),
+    )?;
+    let mut cache = read_cache()?;
+    cache
+        .events
+        .retain(|e| e.calendar.id != entry.calendar.id || e.raw["id"] != entry.raw["id"]);
+    write_cache(&cache)?;
+    Ok(cache)
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Preferences {
     pub hidden_calendars: std::collections::BTreeSet<String>,
@@ -721,5 +790,98 @@ mod tests {
         let d = NaiveDate::from_ymd_opt(2026, 11, 3).unwrap();
         assert!(e.overlaps(d, d + Duration::days(1)));
         assert!(!e.overlaps(d + Duration::days(1), d + Duration::days(2)));
+    }
+}
+
+#[cfg(test)]
+mod deletion_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    fn mock(responses: Vec<&'static str>) -> (reqwest::Url, std::thread::JoinHandle<Vec<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = reqwest::Url::parse(&format!(
+            "http://{}/calendars/test/events/occurrence",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Timeout::from_secs(3)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    assert_eq!(stream.read(&mut byte).unwrap(), 1);
+                    request.push(byte[0]);
+                }
+                requests.push(String::from_utf8(request).unwrap());
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            requests
+        });
+        (url, handle)
+    }
+    #[test]
+    fn delete_checks_version_and_verifies_removal() {
+        let (url, server) = mock(vec![
+            "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 410 Gone\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ]);
+        delete_remote(
+            &Client::builder()
+                .no_proxy()
+                .timeout(Timeout::from_secs(3))
+                .build()
+                .unwrap(),
+            "fake-token",
+            url,
+            "\"version\"",
+        )
+        .unwrap();
+        let requests = server.join().unwrap();
+        assert!(
+            requests[0].starts_with("DELETE /calendars/test/events/occurrence?sendUpdates=none ")
+        );
+        assert!(requests[0].to_lowercase().contains("if-match: \"version\""));
+        assert!(requests[1].starts_with("GET "));
+    }
+    #[test]
+    fn delete_rejects_conflict_without_retry() {
+        let (url, server) = mock(vec![
+            "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ]);
+        assert!(delete_remote(
+            &Client::builder()
+                .no_proxy()
+                .timeout(Timeout::from_secs(3))
+                .build()
+                .unwrap(),
+            "fake-token",
+            url,
+            "etag"
+        )
+        .is_err());
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+    #[test]
+    fn delete_cannot_target_series_or_readonly_calendar() {
+        let mut e = Entry {
+            calendar: Calendar {
+                id: "x".into(),
+                name: "Test".into(),
+                writable: true,
+                color: None,
+            },
+            raw: json!({"id":"x_20261028","etag":"version","recurringEventId":"series"}),
+        };
+        assert!(validate_delete(&e).is_ok());
+        e.raw["recurrence"] = json!(["RRULE:FREQ=WEEKLY"]);
+        assert!(validate_delete(&e).is_err());
+        e.raw.as_object_mut().unwrap().remove("recurrence");
+        e.calendar.writable = false;
+        assert!(validate_delete(&e).is_err());
     }
 }
