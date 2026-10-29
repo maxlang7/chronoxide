@@ -381,6 +381,127 @@ pub fn sync(force: bool) -> Result<Cache> {
     }
     Ok(cache)
 }
+pub const LABELS: [&str; 5] = ["Title", "Start", "End", "Location", "Description"];
+pub fn fields(entry: &Entry) -> [String; 5] {
+    let format = |key| {
+        if entry.all_day() {
+            s(&entry.raw[key], "date")
+        } else {
+            boundary(&entry.raw[key])
+                .map(|t| t.format("%Y-%m-%d %-I:%M %p").to_string())
+                .unwrap_or_default()
+        }
+    };
+    [
+        entry.title(),
+        format("start"),
+        format("end"),
+        s(&entry.raw, "location"),
+        s(&entry.raw, "description"),
+    ]
+}
+fn parse_edit_time(value: &str) -> Result<chrono::NaiveDateTime> {
+    chrono::NaiveDateTime::parse_from_str(value.trim(), "%Y-%m-%d %I:%M %p")
+        .context("Use YYYY-MM-DD h:mm AM/PM, for example 2026-10-28 3:30 PM")
+}
+pub fn patch(entry: &Entry, fields: &[String; 5]) -> Result<Value> {
+    if !entry.calendar.writable {
+        bail!("This calendar is read-only");
+    }
+    if fields[0].trim().is_empty() {
+        bail!("Title cannot be empty");
+    }
+    let original = self::fields(entry);
+    let mut patch = json!({});
+    for (i, key) in [(0, "summary"), (3, "location"), (4, "description")] {
+        if fields[i] != original[i] {
+            patch[key] = json!(fields[i]);
+        }
+    }
+    if fields[1] != original[1] || fields[2] != original[2] {
+        if entry.all_day() {
+            let a = NaiveDate::parse_from_str(&fields[1], "%Y-%m-%d")
+                .context("Start must be YYYY-MM-DD")?;
+            let b = NaiveDate::parse_from_str(&fields[2], "%Y-%m-%d")
+                .context("End must be YYYY-MM-DD, exclusive")?;
+            if b <= a {
+                bail!("End must be after start; all-day end dates are exclusive");
+            }
+            patch["start"] = json!({"date":a.to_string()});
+            patch["end"] = json!({"date":b.to_string()});
+        } else {
+            let parse = |value: &str| -> Result<DateTime<Local>> {
+                let date = parse_edit_time(value)?;
+                Local
+                    .from_local_datetime(&date)
+                    .single()
+                    .context("Time is ambiguous or nonexistent due to DST; choose a different time")
+            };
+            let a = parse(&fields[1])?;
+            let b = parse(&fields[2])?;
+            if b <= a {
+                bail!("End must be after start");
+            }
+            patch["start"] = json!({"dateTime":a.to_rfc3339()});
+            patch["end"] = json!({"dateTime":b.to_rfc3339()});
+        }
+    }
+    Ok(patch)
+}
+pub fn save(entry: Entry, patch: Value) -> Result<Cache> {
+    if !entry.calendar.writable {
+        bail!("Read-only calendar");
+    }
+    let etag = s(&entry.raw, "etag");
+    if etag.is_empty() {
+        bail!("Missing event version. Refresh before editing.");
+    }
+    let _lock = lock()?;
+    let client = client()?;
+    let token = token(&client)?;
+    let url = url(&entry.calendar.id, Some(&s(&entry.raw, "id")))?;
+    let response = client
+        .patch(url.clone())
+        .bearer_auth(&token)
+        .header("If-Match", etag)
+        .query(&[("sendUpdates", "none")])
+        .json(&patch)
+        .send()?;
+    if response.status() == reqwest::StatusCode::PRECONDITION_FAILED {
+        bail!("This event changed on Google. Close this popup and refresh before editing again.");
+    }
+    if !response.status().is_success() {
+        bail!("Save failed: Google returned {}", response.status());
+    }
+    // Verify the stored result through a fresh GET before reporting success.
+    let response = client.get(url).bearer_auth(token).send()?;
+    if !response.status().is_success() {
+        bail!("Save was sent but verification failed. Refresh before retrying.");
+    }
+    let raw: Value = response.json()?;
+    for key in ["summary", "location", "description", "start", "end"] {
+        if let Some(expected) = patch.get(key) {
+            let matches = if matches!(key, "start" | "end") {
+                boundary(expected)? == boundary(&raw[key])?
+            } else {
+                expected == &raw[key]
+            };
+            if !matches {
+                bail!("Google returned a different {key}. Refresh to review the saved event.");
+            }
+        }
+    }
+    let mut cache = read_cache()?;
+    cache
+        .events
+        .retain(|e| e.calendar.id != entry.calendar.id || e.raw["id"] != entry.raw["id"]);
+    cache.events.push(Entry {
+        calendar: entry.calendar,
+        raw,
+    });
+    write_cache(&cache)?;
+    Ok(cache)
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Preferences {
     pub hidden_calendars: std::collections::BTreeSet<String>,
@@ -510,6 +631,13 @@ mod tests {
         }
     }
     #[test]
+    fn us_editor_times_distinguish_noon_and_midnight() {
+        assert_eq!(parse_edit_time("2026-10-28 12:00 AM").unwrap().hour(), 0);
+        assert_eq!(parse_edit_time("2026-10-28 12:00 PM").unwrap().hour(), 12);
+        assert_eq!(parse_edit_time("2026-10-28 3:30 PM").unwrap().hour(), 15);
+        assert!(parse_edit_time("2026-10-28 15:30").is_err());
+    }
+    #[test]
     fn all_day_date_is_preserved() {
         assert_eq!(
             entry().start().unwrap().date_naive().to_string(),
@@ -565,6 +693,26 @@ mod tests {
         merge(&mut c, &e.calendar, vec![], d, d + Duration::days(7));
         assert_eq!(c.events.len(), 1);
         assert_eq!(c.events[0].calendar.id, "other");
+    }
+    #[test]
+    fn patch_changes_only_edited_fields() {
+        let e = entry();
+        let mut f = fields(&e);
+        f[0] = "New".into();
+        assert_eq!(patch(&e, &f).unwrap(), json!({"summary":"New"}));
+    }
+    #[test]
+    fn invalid_end_is_rejected() {
+        let e = entry();
+        let mut f = fields(&e);
+        f[2] = "2026-10-30".into();
+        assert!(patch(&e, &f).is_err());
+    }
+    #[test]
+    fn readonly_edit_is_rejected() {
+        let mut e = entry();
+        e.calendar.writable = false;
+        assert!(patch(&e, &fields(&e)).is_err());
     }
     #[test]
     fn multi_day_overlaps_both_days() {
