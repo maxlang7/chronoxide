@@ -1,8 +1,9 @@
-use crate::backend::{self, Cache, Entry};
+use crate::backend::{self, Cache, Entry, LABELS};
 use anyhow::Result;
 use chrono::{Duration, Local, NaiveDate, Timelike};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{prelude::*, widgets::*};
+use serde_json::Value;
 use std::{
     sync::mpsc,
     time::{Duration as Timeout, Instant},
@@ -68,6 +69,274 @@ fn popup_rect(area: Rect) -> Rect {
         width,
         height,
     )
+}
+struct Editor {
+    entry: Entry,
+    fields: [String; 5],
+    field: usize,
+    cursor: usize,
+    review: Option<Value>,
+    error: String,
+    saving: bool,
+    deleting: bool,
+    delete_confirmation: String,
+    scroll: u16,
+}
+impl Editor {
+    fn new(entry: Entry) -> Self {
+        let fields = backend::fields(&entry);
+        let cursor = fields[0].len();
+        Self {
+            entry,
+            fields,
+            field: 0,
+            cursor,
+            review: None,
+            error: String::new(),
+            saving: false,
+            deleting: false,
+            delete_confirmation: String::new(),
+            scroll: 0,
+        }
+    }
+    fn next(&mut self, back: bool) {
+        self.field = (self.field + if back { 4 } else { 1 }) % 5;
+        self.cursor = self.fields[self.field].len();
+    }
+    fn input(&mut self, key: KeyEvent) {
+        let value = &mut self.fields[self.field];
+        match key.code {
+            KeyCode::Tab | KeyCode::BackTab => self.next(key.code == KeyCode::BackTab),
+            KeyCode::Enter if self.field == 4 => {
+                value.insert(self.cursor, '\n');
+                self.cursor += 1;
+            }
+            KeyCode::Enter => self.next(false),
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                value.clear();
+                self.cursor = 0;
+            }
+            KeyCode::Home => self.cursor = 0,
+            KeyCode::End => self.cursor = value.len(),
+            KeyCode::Left if self.cursor > 0 => {
+                self.cursor = value[..self.cursor]
+                    .char_indices()
+                    .last()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+            }
+            KeyCode::Right if self.cursor < value.len() => {
+                self.cursor += value[self.cursor..].chars().next().unwrap().len_utf8();
+            }
+            KeyCode::Backspace if self.cursor > 0 => {
+                let previous = value[..self.cursor].char_indices().last().unwrap().0;
+                value.replace_range(previous..self.cursor, "");
+                self.cursor = previous;
+            }
+            KeyCode::Delete if self.cursor < value.len() => {
+                let end = self.cursor + value[self.cursor..].chars().next().unwrap().len_utf8();
+                value.replace_range(self.cursor..end, "");
+            }
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                value.insert(self.cursor, c);
+                self.cursor += c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+}
+fn draw_editor(frame: &mut Frame, editor: &Editor, cache: &Cache) {
+    let area = popup_rect(frame.area());
+    frame.render_widget(Clear, area);
+    let c = color(cache, &editor.entry.calendar.id);
+    let title = if editor.saving {
+        if editor.deleting {
+            " Deleting and verifying… "
+        } else {
+            " Saving and verifying… "
+        }
+    } else if editor.deleting {
+        " Delete event · type DELETE then Enter · Esc cancel "
+    } else if editor.review.is_some() {
+        " Confirm · y save / PgUp/PgDn scroll / Esc return "
+    } else if editor.entry.calendar.writable {
+        " Edit · Ctrl+S save · Ctrl+D delete · Esc cancel "
+    } else {
+        " Read-only event · Esc close "
+    };
+    frame.render_widget(
+        Block::bordered()
+            .title(title)
+            .border_style(Style::default().fg(c))
+            .style(Style::default().bg(PANEL).fg(FG)),
+        area,
+    );
+    let inner = Rect::new(
+        area.x + 2,
+        area.y + 1,
+        area.width.saturating_sub(4),
+        area.height.saturating_sub(2),
+    );
+    let scope = if editor.entry.raw["recurringEventId"].is_string() {
+        "This occurrence only"
+    } else {
+        "Single event"
+    };
+    let time = if editor.entry.all_day() {
+        "Dates: YYYY-MM-DD · end date is exclusive"
+    } else {
+        "Times: YYYY-MM-DD h:mm AM/PM · local timezone"
+    };
+    text(
+        frame,
+        Rect::new(inner.x, inner.y, inner.width, 2),
+        if editor.deleting {
+            format!(
+                "Account: {}\nCalendar: {}",
+                backend::account_label(cache),
+                editor.entry.calendar.name
+            )
+        } else {
+            format!(
+                "{} · {}\n{scope} · {time}",
+                backend::account_label(cache),
+                editor.entry.calendar.name
+            )
+        },
+        Style::default().fg(DIM),
+    );
+    if editor.deleting {
+        let f = backend::fields(&editor.entry);
+        let scope = if editor.entry.raw["recurringEventId"].is_string() {
+            "Only this occurrence will be deleted. The rest of the series stays."
+        } else {
+            "This event will be deleted from Google Calendar."
+        };
+        let message = format!(
+            "{}\n\n{}\n→ {}\n\n{scope}\nGuest notifications: none\n\nType DELETE then Enter:\n{}▏",
+            f[0], f[1], f[2], editor.delete_confirmation
+        );
+        frame.render_widget(
+            Paragraph::new(message)
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(FG)),
+            Rect::new(
+                inner.x,
+                inner.y + 3,
+                inner.width,
+                inner.height.saturating_sub(5),
+            ),
+        );
+    } else if editor.review.is_some() {
+        let old = backend::fields(&editor.entry);
+        let mut lines = vec![];
+        for i in 0..5 {
+            if old[i] != editor.fields[i] {
+                lines.push(Line::styled(LABELS[i], Style::default().fg(GOLD)));
+                lines.push(Line::styled(
+                    format!("− {}", old[i]),
+                    Style::default().fg(RED),
+                ));
+                lines.push(Line::styled(
+                    format!("+ {}", editor.fields[i]),
+                    Style::default().fg(COLORS[1]),
+                ));
+                lines.push(Line::raw(""));
+            }
+        }
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((editor.scroll, 0)),
+            Rect::new(
+                inner.x,
+                inner.y + 3,
+                inner.width,
+                inner.height.saturating_sub(5),
+            ),
+        );
+    } else {
+        let mut y = inner.y + 3;
+        for (i, label) in LABELS.iter().enumerate() {
+            let height = if i == 4 {
+                inner.bottom().saturating_sub(y + 3).max(1)
+            } else {
+                2
+            };
+            if y >= inner.bottom().saturating_sub(2) {
+                break;
+            }
+            let active = i == editor.field && editor.entry.calendar.writable;
+            let content = if active {
+                let mut v = editor.fields[i].clone();
+                v.insert(editor.cursor, '▏');
+                v
+            } else {
+                editor.fields[i].clone()
+            };
+            text(
+                frame,
+                Rect::new(inner.x, y, inner.width, 1),
+                format!("{} {label}", if active { "›" } else { " " }),
+                Style::default().fg(if active { GOLD } else { DIM }),
+            );
+            let width = usize::from(inner.width.max(1));
+            let mut wrapped: Vec<Line<'static>> = Vec::new();
+            for line in content.split('\n') {
+                let chars: Vec<char> = line.chars().collect();
+                if chars.is_empty() {
+                    wrapped.push(Line::raw(""));
+                }
+                for part in chars.chunks(width) {
+                    wrapped.push(Line::raw(part.iter().collect::<String>()));
+                }
+            }
+            let available = height.saturating_sub(1).max(1);
+            let cursor_line = if active {
+                editor.fields[i][..editor.cursor]
+                    .split('\n')
+                    .map(|line| line.chars().count() / width + 1)
+                    .sum::<usize>()
+                    .saturating_sub(1)
+            } else {
+                0
+            };
+            let scroll = if active {
+                cursor_line.saturating_sub(usize::from(available.saturating_sub(1))) as u16
+            } else if i == 4 {
+                editor.scroll
+            } else {
+                0
+            };
+            frame.render_widget(
+                Paragraph::new(wrapped)
+                    .scroll((scroll, 0))
+                    .style(Style::default().bg(if active { BG } else { PANEL })),
+                Rect::new(inner.x, y + 1, inner.width, available),
+            );
+            y += height + 1;
+        }
+    }
+    let hint = if editor.error.is_empty() {
+        if editor.entry.calendar.writable {
+            "Tab field · Ctrl+U clear · Ctrl+S review · Ctrl+D delete · Esc cancel"
+        } else {
+            "PgUp/PgDn scroll description · Esc close"
+        }
+        .to_string()
+    } else {
+        editor.error.clone()
+    };
+    text(
+        frame,
+        Rect::new(inner.x, inner.bottom().saturating_sub(2), inner.width, 2),
+        hint,
+        Style::default().fg(if editor.error.is_empty() { DIM } else { RED }),
+    );
 }
 // Use projected half-hour intervals so events never paint over another event in the same cell.
 fn lanes(events: &[(usize, i64, i64)]) -> Vec<(usize, usize, usize)> {
@@ -479,30 +748,6 @@ fn filtered<'a>(
         .filter(|entry| preferences.enabled(&entry.calendar.id))
         .collect()
 }
-fn draw_details(frame: &mut Frame, entry: &Entry, cache: &Cache) {
-    let area = popup_rect(frame.area());
-    frame.render_widget(Clear, area);
-    let f = backend::fields(entry);
-    frame.render_widget(
-        Paragraph::new(format!(
-            "{}\n\n{} → {}\n{}\n{}\n\n{}\n\n{}",
-            f[0],
-            f[1],
-            f[2],
-            entry.calendar.name,
-            backend::account_label(cache),
-            f[3],
-            f[4]
-        ))
-        .wrap(Wrap { trim: false })
-        .block(
-            Block::bordered()
-                .title(" Event · Esc close ")
-                .style(Style::default().bg(PANEL).fg(FG)),
-        ),
-        area,
-    );
-}
 pub fn app(terminal: &mut ratatui::DefaultTerminal, demo: bool) -> Result<()> {
     crossterm::execute!(std::io::stdout(), event::EnableMouseCapture)?;
     let _mouse = MouseCapture;
@@ -522,7 +767,7 @@ pub fn app(terminal: &mut ratatui::DefaultTerminal, demo: bool) -> Result<()> {
         });
     }
     let mut syncing = !demo;
-    let mut detail: Option<Entry> = None;
+    let mut editor: Option<Editor> = None;
     let mut preferences = if demo {
         backend::Preferences::default()
     } else {
@@ -547,11 +792,18 @@ pub fn app(terminal: &mut ratatui::DefaultTerminal, demo: bool) -> Result<()> {
                         String::new()
                     };
                     if operation != "synced" {
-                        detail = None;
+                        editor = None;
                     }
                 }
                 Err(e) => {
                     status = format!("{e:#}");
+                    if let Some(editor) = editor.as_mut() {
+                        editor.saving = false;
+                        editor.deleting = false;
+                        editor.delete_confirmation.clear();
+                        editor.review = None;
+                        editor.error = status.clone();
+                    }
                 }
             }
         }
@@ -627,19 +879,18 @@ pub fn app(terminal: &mut ratatui::DefaultTerminal, demo: bool) -> Result<()> {
                 frame,
                 chunks[2],
                 format!(
-                    "←/→ week · j/k event · wheel scroll · c calendars · Enter view · q quit\n{}",
+                    "←/→ week · j/k event · wheel scroll · c calendars · Enter edit · q quit\n{}",
                     if message.is_empty() {
-                        "PgUp/PgDn scroll · Home/End day · t today · r sync"
+                        "PgUp/PgDn scroll · Home/End day · Del delete · t today · r sync"
                     } else {
                         &message
                     }
                 ),
                 Style::default().fg(if message.is_empty() { DIM } else { GOLD }),
             );
-            if let Some(entry) = &detail {
-                draw_details(frame, entry, &cache);
+            if let Some(editor) = &editor {
+                draw_editor(frame, editor, &cache);
             }
-
             if let Some(menu) = menu.as_mut() {
                 calendar_menu(frame, &cache, &preferences, menu, demo);
             }
@@ -667,6 +918,12 @@ pub fn app(terminal: &mut ratatui::DefaultTerminal, demo: bool) -> Result<()> {
                     } else {
                         (current + 1).min(cache.calendars.len().saturating_sub(1))
                     }));
+                } else if let Some(editor) = editor.as_mut() {
+                    if delta < 0 {
+                        editor.scroll = editor.scroll.saturating_sub(2);
+                    } else {
+                        editor.scroll = editor.scroll.saturating_add(2);
+                    }
                 } else {
                     offset += delta;
                 }
@@ -675,12 +932,6 @@ pub fn app(terminal: &mut ratatui::DefaultTerminal, demo: bool) -> Result<()> {
             _ => continue,
         };
         if key.kind != KeyEventKind::Press {
-            continue;
-        }
-        if detail.is_some() {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
-                detail = None;
-            }
             continue;
         }
         if let Some(state) = menu.as_mut() {
@@ -734,7 +985,103 @@ pub fn app(terminal: &mut ratatui::DefaultTerminal, demo: bool) -> Result<()> {
             }
             continue;
         }
-
+        if let Some(edit) = editor.as_mut() {
+            if edit.saving {
+                continue;
+            }
+            if edit.deleting {
+                match key.code {
+                    KeyCode::Esc => {
+                        edit.deleting = false;
+                        edit.delete_confirmation.clear();
+                    }
+                    KeyCode::Backspace => {
+                        edit.delete_confirmation.pop();
+                    }
+                    KeyCode::Char(c)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                            && edit.delete_confirmation.len() < 6 =>
+                    {
+                        edit.delete_confirmation.push(c);
+                    }
+                    KeyCode::Enter if edit.delete_confirmation == "DELETE" => {
+                        let entry = edit.entry.clone();
+                        let tx = tx.clone();
+                        edit.saving = true;
+                        std::thread::spawn(move || {
+                            let _ = tx.send(("deleted", backend::delete(entry)));
+                        });
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            if edit.review.is_some() {
+                if key.code == KeyCode::PageDown {
+                    edit.scroll = edit.scroll.saturating_add(5);
+                    continue;
+                }
+                if key.code == KeyCode::PageUp {
+                    edit.scroll = edit.scroll.saturating_sub(5);
+                    continue;
+                }
+                if key.code == KeyCode::Esc {
+                    edit.review = None;
+                    continue;
+                }
+                if key.code == KeyCode::Char('y') {
+                    let entry = edit.entry.clone();
+                    let patch = edit.review.clone().unwrap();
+                    let tx = tx.clone();
+                    edit.saving = true;
+                    std::thread::spawn(move || {
+                        let _ = tx.send(("saved", backend::save(entry, patch)));
+                    });
+                }
+                continue;
+            }
+            if key.code == KeyCode::Esc {
+                editor = None;
+                continue;
+            }
+            if !edit.entry.calendar.writable {
+                match key.code {
+                    KeyCode::PageDown => edit.scroll = edit.scroll.saturating_add(3),
+                    KeyCode::PageUp => edit.scroll = edit.scroll.saturating_sub(3),
+                    _ => {}
+                }
+                continue;
+            }
+            if key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                match backend::validate_delete(&edit.entry) {
+                    Ok(()) => {
+                        edit.deleting = true;
+                        edit.delete_confirmation.clear();
+                        edit.error.clear();
+                    }
+                    Err(e) => edit.error = e.to_string(),
+                }
+                continue;
+            }
+            if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                match backend::patch(&edit.entry, &edit.fields) {
+                    Ok(patch) if patch.as_object().is_some_and(|p| p.is_empty()) => {
+                        edit.error = "No changes to save".into();
+                    }
+                    Ok(patch) => {
+                        edit.review = Some(patch);
+                        edit.scroll = 0;
+                        edit.error.clear();
+                    }
+                    Err(e) => edit.error = format!("{e:#}"),
+                }
+            } else {
+                edit.input(key);
+            }
+            continue;
+        }
         match key.code {
             KeyCode::Char('c') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 menu = Some(ListState::default().with_selected(Some(0)))
@@ -786,10 +1133,21 @@ pub fn app(terminal: &mut ratatui::DefaultTerminal, demo: bool) -> Result<()> {
                 syncing = true;
                 last_sync = Instant::now();
             }
-
+            KeyCode::Delete => {
+                if let Some(entry) = entries.get(selected) {
+                    match backend::validate_delete(entry) {
+                        Ok(()) => {
+                            let mut popup = Editor::new((*entry).clone());
+                            popup.deleting = true;
+                            editor = Some(popup);
+                        }
+                        Err(e) => status = e.to_string(),
+                    }
+                }
+            }
             KeyCode::Enter => {
                 if let Some(entry) = entries.get(selected) {
-                    detail = Some((*entry).clone());
+                    editor = Some(Editor::new((*entry).clone()));
                 }
             }
             _ => {}
@@ -830,6 +1188,21 @@ mod tests {
     fn connected_overlap_group_uses_peak_lanes() {
         let result = lanes(&[(0, 10, 20), (1, 12, 14), (2, 14, 16)]);
         assert_eq!(result, vec![(0, 0, 2), (1, 1, 2), (2, 1, 2)]);
+    }
+    #[test]
+    fn editor_handles_unicode() {
+        let e = Entry {
+            calendar: backend::Calendar {
+                id: "x".into(),
+                name: "x".into(),
+                writable: true,
+                color: None,
+            },
+            raw: serde_json::json!({"summary":"é"}),
+        };
+        let mut editor = Editor::new(e);
+        editor.input(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(editor.fields[0], "");
     }
 }
 
