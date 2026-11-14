@@ -1,4 +1,6 @@
-# calendar-tui
+# Chronoxide
+
+<img src="assets/chronoxide-icon.png" alt="Chronoxide icon" width="160">
 
 [![Rust](https://github.com/maxlang7/calendar-tui/actions/workflows/ci.yml/badge.svg)](https://github.com/maxlang7/calendar-tui/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
